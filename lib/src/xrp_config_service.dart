@@ -43,10 +43,21 @@ enum XrpConfigProgress {
 }
 
 class XrpConfigService {
-  XrpConfigService({HttpClient? httpClient})
-    : _httpClient = httpClient ?? HttpClient();
+  XrpConfigService({
+    HttpClient? httpClient,
+    Future<ProcessResult> Function(String executable, List<String> arguments)?
+    processRunner,
+  }) : _httpClient = httpClient ?? HttpClient(),
+       _processRunner =
+           processRunner ??
+           ((executable, arguments) => Process.run(executable, arguments));
 
   final HttpClient _httpClient;
+  final Future<ProcessResult> Function(
+    String executable,
+    List<String> arguments,
+  )
+  _processRunner;
 
   Map<String, Object?> buildConfig(
     Map<String, Object?> current,
@@ -76,45 +87,69 @@ class XrpConfigService {
     String baseUrl = 'http://192.168.42.1:5000',
     bool connectWifi = true,
     void Function(XrpConfigProgress progress)? onProgress,
+    void Function(String message)? onLog,
   }) async {
+    _log(
+      onLog,
+      'Starting config for original AP "$originalApSsid" at $baseUrl; '
+      'auto Wi-Fi ${connectWifi ? 'enabled' : 'disabled'}.',
+    );
     Map<String, Object?>? current;
     if (connectWifi) {
       try {
         onProgress?.call(XrpConfigProgress.connectingWifi);
-        await connectWithNmcli(originalApSsid, originalApPassword);
+        await connectWithSystemWifi(
+          originalApSsid,
+          originalApPassword,
+          onLog: onLog,
+        );
         onProgress?.call(XrpConfigProgress.readingConfig);
+        _log(onLog, 'Wi-Fi helper finished; probing XRP HTTP config.');
         current = await _getConfigOrFallback(
           baseUrl: baseUrl,
           originalApSsid: originalApSsid,
           originalApPassword: originalApPassword,
+          onLog: onLog,
         );
         onProgress?.call(XrpConfigProgress.wifiConnected);
       } catch (error) {
+        _log(
+          onLog,
+          'Automatic Wi-Fi path failed: $error. Probing XRP HTTP directly.',
+        );
         try {
           onProgress?.call(XrpConfigProgress.readingConfig);
           current = await _getConfigOrFallback(
             baseUrl: baseUrl,
             originalApSsid: originalApSsid,
             originalApPassword: originalApPassword,
+            onLog: onLog,
           );
           onProgress?.call(XrpConfigProgress.wifiConnected);
         } catch (_) {
           throw error;
         }
       }
+    } else {
+      _log(
+        onLog,
+        'Automatic Wi-Fi disabled; expecting the PC to already reach the XRP.',
+      );
     }
     onProgress?.call(XrpConfigProgress.readingConfig);
     current ??= await _getConfigOrFallback(
       baseUrl: baseUrl,
       originalApSsid: originalApSsid,
       originalApPassword: originalApPassword,
+      onLog: onLog,
     );
     final next = buildConfig(current, credentials);
     onProgress?.call(XrpConfigProgress.sendingConfig);
-    await saveConfig(next, baseUrl: baseUrl);
+    await saveConfig(next, baseUrl: baseUrl, onLog: onLog);
     onProgress?.call(XrpConfigProgress.verifyingConfig);
-    final saved = await getConfig(baseUrl: baseUrl, attempts: 5);
+    final saved = await getConfig(baseUrl: baseUrl, attempts: 5, onLog: onLog);
     verifySavedConfig(saved, credentials);
+    _log(onLog, 'Verified XRP saved config matches requested credentials.');
     onProgress?.call(XrpConfigProgress.configSaved);
   }
 
@@ -122,10 +157,15 @@ class XrpConfigService {
     required String baseUrl,
     required String originalApSsid,
     required String originalApPassword,
+    void Function(String message)? onLog,
   }) async {
     try {
-      return await getConfig(baseUrl: baseUrl, attempts: 5);
-    } on XrpConfigException {
+      return await getConfig(baseUrl: baseUrl, attempts: 5, onLog: onLog);
+    } on XrpConfigException catch (error) {
+      _log(
+        onLog,
+        'Could not read current config; using repaired base config. ${error.message}',
+      );
       return _repairBaseConfig(
         originalApSsid: originalApSsid,
         originalApPassword: originalApPassword,
@@ -147,8 +187,33 @@ class XrpConfigService {
     };
   }
 
-  Future<void> connectWithNmcli(String ssid, String password) async {
-    await _tryNmcli(['device', 'wifi', 'rescan', 'ssid', ssid]);
+  Future<void> connectWithSystemWifi(
+    String ssid,
+    String password, {
+    void Function(String message)? onLog,
+  }) {
+    if (Platform.isWindows) {
+      return connectWithWindowsWifi(ssid, password, onLog: onLog);
+    }
+    if (Platform.isLinux) {
+      return connectWithNmcli(ssid, password, onLog: onLog);
+    }
+    _log(
+      onLog,
+      'Automatic Wi-Fi is not implemented for ${Platform.operatingSystem}.',
+    );
+    throw UnsupportedError(
+      'Automatic Wi-Fi is not implemented for ${Platform.operatingSystem}.',
+    );
+  }
+
+  Future<void> connectWithNmcli(
+    String ssid,
+    String password, {
+    void Function(String message)? onLog,
+  }) async {
+    _log(onLog, 'Linux Wi-Fi: rescanning for "$ssid" with nmcli.');
+    await _tryNmcli(['device', 'wifi', 'rescan', 'ssid', ssid], onLog: onLog);
     await Future<void>.delayed(const Duration(seconds: 2));
     var result = await _runNmcli([
       'device',
@@ -157,10 +222,20 @@ class XrpConfigService {
       ssid,
       'password',
       password,
-    ]);
-    if (result.exitCode == 0 || _isNmcliActivationPending(result)) return;
+    ], onLog: onLog);
+    if (result.exitCode == 0 || _isNmcliActivationPending(result)) {
+      _log(onLog, 'nmcli reported connection activation for "$ssid".');
+      return;
+    }
 
-    await _tryNmcli(['device', 'wifi', 'list', '--rescan', 'yes']);
+    _log(onLog, 'nmcli first connect failed; rescanning visible Wi-Fi list.');
+    await _tryNmcli([
+      'device',
+      'wifi',
+      'list',
+      '--rescan',
+      'yes',
+    ], onLog: onLog);
     await Future<void>.delayed(const Duration(seconds: 2));
     result = await _runNmcli([
       'device',
@@ -169,7 +244,7 @@ class XrpConfigService {
       ssid,
       'password',
       password,
-    ]);
+    ], onLog: onLog);
     if (result.exitCode != 0 && !_isNmcliActivationPending(result)) {
       throw ProcessException(
         'nmcli',
@@ -178,28 +253,242 @@ class XrpConfigService {
         result.exitCode,
       );
     }
+    _log(onLog, 'nmcli retry reported connection activation for "$ssid".');
   }
 
-  Future<ProcessResult> _runNmcli(List<String> arguments) {
-    return Process.run('nmcli', arguments);
-  }
+  Future<void> connectWithWindowsWifi(
+    String ssid,
+    String password, {
+    void Function(String message)? onLog,
+  }) async {
+    _log(onLog, 'Windows Wi-Fi: scanning visible networks with netsh.');
+    final visible = await _tryNetsh([
+      'wlan',
+      'show',
+      'networks',
+      'mode=bssid',
+    ], onLog: onLog);
+    if (visible != null) {
+      final isVisible = _outputContainsSsid(visible, ssid);
+      _log(
+        onLog,
+        'Windows Wi-Fi: "$ssid" ${isVisible ? 'is' : 'is not'} visible in the latest netsh scan.',
+      );
+    }
 
-  Future<void> _tryNmcli(List<String> arguments) async {
+    final profile = await _writeWindowsWifiProfile(ssid, password);
+    _log(onLog, 'Windows Wi-Fi: wrote temporary WLAN profile ${profile.path}.');
+    ProcessResult? lastConnect;
     try {
-      await _runNmcli(arguments);
-    } catch (_) {
+      final addProfile = await _runNetsh([
+        'wlan',
+        'add',
+        'profile',
+        'filename=${profile.path}',
+        'user=current',
+      ], onLog: onLog);
+      if (addProfile.exitCode != 0) {
+        throw ProcessException(
+          'netsh',
+          ['wlan', 'add', 'profile', 'filename=<temp-profile>', 'user=current'],
+          '${addProfile.stderr}\n${addProfile.stdout}'.trim(),
+          addProfile.exitCode,
+        );
+      }
+
+      for (var attempt = 1; attempt <= 2; attempt++) {
+        _log(onLog, 'Windows Wi-Fi: connect attempt $attempt for "$ssid".');
+        lastConnect = await _runNetsh([
+          'wlan',
+          'connect',
+          'name=$ssid',
+          'ssid=$ssid',
+        ], onLog: onLog);
+        if (await _waitForWindowsWifiConnection(ssid, onLog: onLog)) {
+          return;
+        }
+        await _tryNetsh([
+          'wlan',
+          'show',
+          'networks',
+          'mode=bssid',
+        ], onLog: onLog);
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
+    } finally {
+      try {
+        if (await profile.exists()) await profile.delete();
+      } catch (_) {
+        _log(onLog, 'Windows Wi-Fi: could not delete ${profile.path}.');
+      }
+    }
+
+    throw ProcessException(
+      'netsh',
+      ['wlan', 'connect', 'name=$ssid', 'ssid=$ssid'],
+      lastConnect == null
+          ? 'Windows did not report connection to $ssid.'
+          : '${lastConnect.stderr}\n${lastConnect.stdout}'.trim(),
+      lastConnect?.exitCode ?? -1,
+    );
+  }
+
+  Future<ProcessResult> _runNmcli(
+    List<String> arguments, {
+    void Function(String message)? onLog,
+  }) {
+    _log(onLog, 'Running nmcli ${_maskArgs(arguments).join(' ')}.');
+    return _processRunner('nmcli', arguments).then((result) {
+      _logProcessResult(onLog, 'nmcli', result);
+      return result;
+    });
+  }
+
+  Future<void> _tryNmcli(
+    List<String> arguments, {
+    void Function(String message)? onLog,
+  }) async {
+    try {
+      await _runNmcli(arguments, onLog: onLog);
+    } catch (error) {
+      _log(onLog, 'Best-effort nmcli command failed: $error.');
       // Best effort only; the actual connect command reports the real failure.
     }
+  }
+
+  Future<ProcessResult> _runNetsh(
+    List<String> arguments, {
+    void Function(String message)? onLog,
+  }) {
+    _log(onLog, 'Running netsh ${_maskArgs(arguments).join(' ')}.');
+    return _processRunner('netsh', arguments).then((result) {
+      _logProcessResult(onLog, 'netsh', result);
+      return result;
+    });
+  }
+
+  Future<ProcessResult?> _tryNetsh(
+    List<String> arguments, {
+    void Function(String message)? onLog,
+  }) async {
+    try {
+      return await _runNetsh(arguments, onLog: onLog);
+    } catch (error) {
+      _log(onLog, 'Best-effort netsh command failed: $error.');
+      return null;
+    }
+  }
+
+  Future<File> _writeWindowsWifiProfile(String ssid, String password) async {
+    final safeName = ssid.replaceAll(RegExp(r'[^A-Za-z0-9_.-]'), '_');
+    final file = File(
+      '${Directory.systemTemp.path}${Platform.pathSeparator}'
+      'xrp-flasher-$safeName-${DateTime.now().microsecondsSinceEpoch}.xml',
+    );
+    await file.writeAsString(_windowsWifiProfileXml(ssid, password));
+    return file;
+  }
+
+  String _windowsWifiProfileXml(String ssid, String password) {
+    final escapedSsid = _escapeXml(ssid);
+    final escapedPassword = _escapeXml(password);
+    final security = password.trim().isEmpty
+        ? '''
+      <authEncryption>
+        <authentication>open</authentication>
+        <encryption>none</encryption>
+        <useOneX>false</useOneX>
+      </authEncryption>'''
+        : '''
+      <authEncryption>
+        <authentication>WPA2PSK</authentication>
+        <encryption>AES</encryption>
+        <useOneX>false</useOneX>
+      </authEncryption>
+      <sharedKey>
+        <keyType>passPhrase</keyType>
+        <protected>false</protected>
+        <keyMaterial>$escapedPassword</keyMaterial>
+      </sharedKey>''';
+    return '''
+<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+  <name>$escapedSsid</name>
+  <SSIDConfig>
+    <SSID>
+      <name>$escapedSsid</name>
+    </SSID>
+  </SSIDConfig>
+  <connectionType>ESS</connectionType>
+  <connectionMode>manual</connectionMode>
+  <MSM>
+    <security>
+$security
+    </security>
+  </MSM>
+</WLANProfile>
+''';
+  }
+
+  Future<bool> _waitForWindowsWifiConnection(
+    String ssid, {
+    void Function(String message)? onLog,
+  }) async {
+    for (var attempt = 1; attempt <= 8; attempt++) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      final result = await _tryNetsh([
+        'wlan',
+        'show',
+        'interfaces',
+      ], onLog: onLog);
+      if (result == null) continue;
+      final output = '${result.stdout}\n${result.stderr}';
+      if (_windowsInterfacesConnectedTo(output, ssid)) {
+        _log(onLog, 'Windows Wi-Fi: interface reports connected to "$ssid".');
+        return true;
+      }
+      _log(
+        onLog,
+        'Windows Wi-Fi: "$ssid" not connected yet '
+        '(poll $attempt/8).',
+      );
+    }
+    return false;
+  }
+
+  bool _windowsInterfacesConnectedTo(String output, String ssid) {
+    final stateConnected = RegExp(
+      r'^\s*State\s*:\s*connected\s*$',
+      caseSensitive: false,
+      multiLine: true,
+    ).hasMatch(output);
+    final ssidMatches = RegExp(
+      r'^\s*SSID\s*:\s*(.+?)\s*$',
+      caseSensitive: false,
+      multiLine: true,
+    ).allMatches(output).any((match) => match.group(1)?.trim() == ssid);
+    return stateConnected && ssidMatches;
+  }
+
+  bool _outputContainsSsid(ProcessResult result, String ssid) {
+    final output = '${result.stdout}\n${result.stderr}';
+    return RegExp(
+      r'^\s*SSID\s+\d+\s*:\s*(.+?)\s*$',
+      caseSensitive: false,
+      multiLine: true,
+    ).allMatches(output).any((match) => match.group(1)?.trim() == ssid);
   }
 
   Future<Map<String, Object?>> getConfig({
     String baseUrl = 'http://192.168.42.1:5000',
     int attempts = 12,
     Duration retryDelay = const Duration(seconds: 1),
+    void Function(String message)? onLog,
   }) async {
     final failures = <String>[];
     for (var attempt = 1; attempt <= attempts; attempt++) {
       failures.clear();
+      _log(onLog, 'HTTP config read attempt $attempt/$attempts.');
       for (final path in ['/getconfig', '/']) {
         final uri = _uri(baseUrl, path);
         final _HttpResult result;
@@ -207,16 +496,21 @@ class XrpConfigService {
           result = await _request(uri);
         } catch (error) {
           failures.add('GET $uri failed: $error');
+          _log(onLog, 'GET $uri failed: $error.');
           continue;
         }
         if (!result.isSuccess) {
           failures.add(result.describe());
+          _log(onLog, result.describe());
           continue;
         }
         try {
-          return _decodeConfig(result);
+          final config = _decodeConfig(result);
+          _log(onLog, 'Read XRP config from $uri.');
+          return config;
         } on XrpConfigException catch (error) {
           failures.add(error.message);
+          _log(onLog, error.message);
         }
       }
       if (attempt < attempts) {
@@ -231,9 +525,11 @@ class XrpConfigService {
   Future<void> saveConfig(
     Map<String, Object?> config, {
     String baseUrl = 'http://192.168.42.1:5000',
+    void Function(String message)? onLog,
   }) async {
     final body = const JsonEncoder.withIndent('  ').convert(config);
     final failures = <String>[];
+    _log(onLog, 'Saving XRP config (${body.length} bytes).');
     for (final endpoint in const [
       ('POST', '/saveconfig', 'text/json'),
       ('POST', '/saveconfig', 'application/json'),
@@ -244,6 +540,7 @@ class XrpConfigService {
         body: body,
         contentType: endpoint.$3,
       );
+      _log(onLog, result.describe());
       if (result.isSuccess) return;
       failures.add(result.describe());
     }
@@ -391,6 +688,51 @@ class XrpConfigService {
 
   Map<String, Object?> _deepCopy(Map<String, Object?> value) {
     return jsonDecode(jsonEncode(value)) as Map<String, Object?>;
+  }
+
+  List<String> _maskArgs(List<String> arguments) {
+    final masked = <String>[];
+    for (var i = 0; i < arguments.length; i++) {
+      final previous = i > 0 ? arguments[i - 1].toLowerCase() : '';
+      final current = arguments[i].toLowerCase();
+      if (previous == 'password' ||
+          current.startsWith('keymaterial=') ||
+          current.startsWith('filename=')) {
+        masked.add(
+          current.startsWith('filename=')
+              ? 'filename=<temp-profile>'
+              : '********',
+        );
+      } else {
+        masked.add(arguments[i]);
+      }
+    }
+    return masked;
+  }
+
+  void _logProcessResult(
+    void Function(String message)? onLog,
+    String executable,
+    ProcessResult result,
+  ) {
+    final output = '${result.stderr}\n${result.stdout}'.trim();
+    final suffix = output.isEmpty
+        ? ''
+        : ': ${_preview(output, maxLength: 500)}';
+    _log(onLog, '$executable exit ${result.exitCode}$suffix');
+  }
+
+  String _escapeXml(String value) {
+    return value
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&apos;');
+  }
+
+  void _log(void Function(String message)? onLog, String message) {
+    onLog?.call(message);
   }
 }
 

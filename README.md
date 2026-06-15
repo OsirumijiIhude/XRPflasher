@@ -13,17 +13,18 @@ XRP Flasher is a desktop app for preparing XRP robots in batches. It watches for
    - **Windows:** download `xrp_flasher-windows-x64-setup.exe`, run it, then open **XRP Flasher** from the Start menu.
    - **Linux:** download `xrp_flasher-linux-x86_64.AppImage`, mark it as executable if your desktop asks, then double-click it.
 
-If you are on Windows and the installer is blocked by SmartScreen, click **More info** and only continue if the file came from this repository's release page. The app is currently designed and tested mainly for Linux hardware workflows. The Windows build is packaged automatically, but some USB-volume and Wi-Fi automation may need Windows-specific code before it can fully replace the Linux version.
+If you are on Windows and the installer is blocked by SmartScreen, click **More info** and only continue if the file came from this repository's release page.
 
 ## What You Need
 
 - An XRP robot or controller board.
 - A USB cable that supports data, not just charging.
-- A Linux computer is recommended for the full workflow.
-- NetworkManager with `nmcli` is recommended if you want the app to connect to each robot's Wi-Fi automatically.
-- `udisksctl` is recommended so the app can mount unmounted XRP drives.
+- A Windows or Linux computer.
+- On Linux, NetworkManager with `nmcli` is recommended if you want the app to connect to each robot's Wi-Fi automatically.
+- On Linux, `udisksctl` is recommended so the app can mount unmounted XRP drives.
 
 The app includes the firmware file `xrp-wpilib-firmware-2.1.0-aa439f0.uf2`. You can also type a different `.uf2` firmware path in the app if you want to flash another version.
+Click **Download UF2** to fetch the same firmware from WPILib's GitHub release. The app logs download start, progress, file verification, and the final local path before using it for flashing.
 
 ## Basic Robot Workflow
 
@@ -38,7 +39,7 @@ The app includes the firmware file `xrp-wpilib-firmware-2.1.0-aa439f0.uf2`. You 
    - Robot `5` becomes AP password `XRP_Robot_5`.
    - The default station network is `XRC-AP` with password `xrc-psc-ap`.
 8. Change the AP or station credentials if needed.
-9. Click **Configure**. With `nmcli` enabled, the app tries to connect to the robot's original access point, update its config over HTTP, and verify that the saved config matches.
+9. Click **Configure**. With **Auto Wi-Fi** enabled, the app tries to connect to the robot's original access point, update its config over HTTP, and verify that the saved config matches. Linux uses `nmcli`; Windows uses `netsh` WLAN profiles.
 10. Restart the robot after the app reports **Config saved**.
 
 ## Helpful Buttons And Switches
@@ -46,10 +47,11 @@ The app includes the firmware file `xrp-wpilib-firmware-2.1.0-aa439f0.uf2`. You 
 - **Auto flash:** flashes each detected bootloader volume as soon as it appears.
 - **Auto read:** reads `PICODISK` status files as soon as they appear.
 - **Auto save:** writes record files after successful reads or configuration.
-- **nmcli:** lets the app use Linux NetworkManager to connect to the robot Wi-Fi.
+- **Auto Wi-Fi:** lets the app use Linux `nmcli` or Windows `netsh` to connect to the robot Wi-Fi.
 - **Assign missing:** fills empty robot-number boxes with the next available numbers.
 - **Copy row:** copies one tab-separated row for spreadsheets.
 - **Latest:** checks the latest upstream XRP WPILib firmware release on GitHub.
+- **Download UF2:** downloads `xrp-wpilib-firmware-2.1.0-aa439f0.uf2`, verifies the file length and UF2 block structure, then updates the firmware path.
 
 ## Where Records Go
 
@@ -69,9 +71,10 @@ These files include robot credentials and Wi-Fi passwords in plain text. Keep th
 ## Troubleshooting
 
 - **No device appears:** click **Scan**, check that the USB cable supports data, and confirm that the drive is mounted or visible in your file manager.
+- **Windows permission check:** click **Scan** and read the event log. If the log says the app can list the drive root, normal filesystem permission is not the detection blocker. If it says access failed, check Windows security policy, removable-drive restrictions, or whether the volume disconnected.
 - **Flash fails:** check that the firmware path points to an existing `.uf2` file and that the bootloader drive is writable.
 - **PICODISK never appears:** unplug and replug the robot after flashing, then wait a few seconds and scan again.
-- **Configure fails while connecting Wi-Fi:** turn off the `nmcli` switch and manually connect your computer to the robot's Wi-Fi, then click **Configure** again.
+- **Configure fails while connecting Wi-Fi:** turn off the **Auto Wi-Fi** switch and manually connect your computer to the robot's Wi-Fi, then click **Configure** again.
 - **Permission or mount errors on Linux:** install or enable desktop automount support, or make sure `udisksctl mount -b /dev/...` works for your user.
 
 ## Developer Setup
@@ -110,8 +113,8 @@ The GitHub Actions workflow in `.github/workflows/package.yml` builds both Windo
 ## How The App Works Internally
 
 - `lib/main.dart` owns the Flutter UI, per-robot state, batch actions, log panel, and controller lifecycle.
-- `lib/src/device_watcher.dart` polls every two seconds and finds matching USB volumes from `/proc/mounts`, `lsblk`, `/media`, `/run/media`, and `/mnt`.
-- `lib/src/firmware_manager.dart` mounts unmounted block devices with `udisksctl`, copies the selected `.uf2` file to the bootloader drive, runs `sync`, reads status files, and checks upstream firmware releases.
+- `lib/src/device_watcher.dart` polls every two seconds and finds matching USB volumes from `/proc/mounts`, `lsblk`, `/media`, `/run/media`, `/mnt`, Windows PowerShell `Get-Volume`, Windows `wmic`, Windows drive-letter probing, and XRP marker files such as `INFO_UF2.TXT` or `xrp-status.txt`.
+- `lib/src/firmware_manager.dart` mounts unmounted Linux block devices with `udisksctl`, copies the selected `.uf2` file to the bootloader drive, runs `sync` where available, reads status files, and checks upstream firmware releases.
 - `lib/src/status_parser.dart` extracts fields such as firmware version, chip ID, Wi-Fi mode, AP SSID, AP password, and IP address from XRP status text.
 - `lib/src/xrp_config_service.dart` reads the robot HTTP config from `http://192.168.42.1:5000`, repairs empty configs when needed, writes AP/STA Wi-Fi settings, and verifies the saved config.
 - `lib/src/record_store.dart` writes `robots.json` plus one text report per numbered robot.
@@ -119,9 +122,9 @@ The GitHub Actions workflow in `.github/workflows/package.yml` builds both Windo
 
 ## Compatibility Notes
 
-Linux is the primary supported OS today. The app depends on Linux-style mounted volumes, `/proc/mounts`, `lsblk`, `udisksctl`, and optionally `nmcli`.
+Linux supports mounted-volume detection through `/proc/mounts`, `lsblk`, common mount roots, `udisksctl` mounting, and optional `nmcli` Wi-Fi automation.
 
-Windows packages are built automatically, but the current device watcher does not use Windows APIs for removable drives or Wi-Fi profile management. The app may open on Windows, but full flashing/configuration should be treated as experimental until Windows-specific detection and networking support are added.
+Windows supports mounted drive detection through PowerShell `Get-Volume`, `wmic`, drive-letter probing, and marker-file fallback. The Wi-Fi automation path creates a temporary `netsh` WLAN profile, connects to the XRP AP, polls the active Wi-Fi interface, then confirms success by reading the XRP HTTP config endpoint. If Windows blocks automatic connection, leave **Auto Wi-Fi** off and connect to the XRP network manually before clicking **Configure**.
 
 macOS is not scaffolded in this repository. A fork could add macOS with `flutter create --platforms=macos .`, but drive detection, mounting, signing, notarization, and Wi-Fi automation would need separate implementation and testing.
 
@@ -132,7 +135,7 @@ macOS is not scaffolded in this repository. A fork could add macOS with `flutter
 3. Replace the bundled `.uf2` file and update `FirmwareManager.bundledFirmwareName`.
 4. Adjust `RobotCredentials.defaults` if your robot naming, AP password, or station network should differ.
 5. Replace `XrpConfigService.buildConfig` if the target robot uses a different HTTP API or config schema.
-6. Add platform-specific `DeviceWatcher` and Wi-Fi code before claiming support for a new OS.
+6. Add platform-specific `DeviceWatcher` and Wi-Fi code before claiming support for another OS.
 
 ## License
 

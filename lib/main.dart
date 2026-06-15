@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -47,8 +48,8 @@ class DashboardPage extends StatefulWidget {
 }
 
 class _DashboardPageState extends State<DashboardPage> {
-  final _watcher = DeviceWatcher();
-  final _firmware = FirmwareManager();
+  late final DeviceWatcher _watcher;
+  late final FirmwareManager _firmware;
   final _records = const RecordStore();
   final _config = XrpConfigService();
   final _logs = <String>[];
@@ -66,14 +67,20 @@ class _DashboardPageState extends State<DashboardPage> {
   bool _autoFlash = false;
   bool _autoReadPicodisk = true;
   bool _autoSaveRecords = true;
-  bool _connectWithNmcli = true;
+  bool _connectWifiAutomatically = true;
   bool _showLog = true;
   bool _configurationInProgress = false;
   String? _latestReleaseSummary;
+  String? _firmwareDownloadSummary;
+  double? _firmwareDownloadProgress;
+  bool _firmwareDownloading = false;
+  int? _firmwareDownloadLogBucket;
 
   @override
   void initState() {
     super.initState();
+    _watcher = DeviceWatcher(onLog: _log);
+    _firmware = FirmwareManager(onLog: _log);
     _firmwareController = TextEditingController(
       text: _firmware.defaultFirmwarePath,
     );
@@ -82,7 +89,12 @@ class _DashboardPageState extends State<DashboardPage> {
     );
     _subscription = _watcher.volumes.listen(_handleVolumes, onError: _log);
     _watcher.start();
-    _log('Watching for RPI-RP2, RP2350*, and PICODISK volumes.');
+    _log(
+      'Running on ${Platform.operatingSystem} ${Platform.operatingSystemVersion}.',
+    );
+    _log(
+      'Watching for RPI-RP2, RP2350*, and PICODISK volumes. Manual Scan runs verbose multi-method detection.',
+    );
   }
 
   @override
@@ -118,11 +130,12 @@ class _DashboardPageState extends State<DashboardPage> {
             bootloaderVolume: volume,
           );
           _ensureControllers(key);
-          _log('Bootloader detected at ${volume.location}.');
+          _log('Bootloader detected: ${_describeVolume(volume)}.');
           changed = true;
           if (_autoFlash) unawaited(_flash(key));
         } else if (_volumeChanged(existing.bootloaderVolume, volume)) {
           _robots[existing.id] = existing.copyWith(bootloaderVolume: volume);
+          _log('Bootloader location updated: ${_describeVolume(volume)}.');
           changed = true;
         }
       }
@@ -148,7 +161,9 @@ class _DashboardPageState extends State<DashboardPage> {
           clearError: record.status == null,
         );
         _ensureControllers(key);
-        if (isNewPicodisk) _log('PICODISK detected at ${volume.location}.');
+        if (isNewPicodisk) {
+          _log('PICODISK detected: ${_describeVolume(volume)}.');
+        }
         changed = true;
         if (_autoReadPicodisk &&
             !_isConfigurationComplete(record) &&
@@ -459,13 +474,19 @@ class _DashboardPageState extends State<DashboardPage> {
       id,
       record.copyWith(stage: DeviceStage.connectingWifi, clearError: true),
     );
+    _log(
+      'Configuring ${record.displayName}: original AP "$apSsid", '
+      'target AP "${credentials.apSsid}", station "${credentials.staSsid}", '
+      'automatic Wi-Fi ${_connectWifiAutomatically ? 'on' : 'off'}.',
+    );
     try {
       await _config.configure(
         credentials: credentials,
         originalApSsid: apSsid,
         originalApPassword: apPass,
-        connectWifi: _connectWithNmcli,
+        connectWifi: _connectWifiAutomatically,
         onProgress: (progress) => _setConfigProgress(id, progress),
+        onLog: _log,
       );
       _markConfigurationComplete(_robots[id]!);
       _setRecord(id, _robots[id]!.copyWith(stage: DeviceStage.configSaved));
@@ -493,12 +514,72 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
+  Future<void> _downloadFirmwareFromNetwork() async {
+    if (_firmwareDownloading) return;
+    setState(() {
+      _firmwareDownloading = true;
+      _firmwareDownloadProgress = null;
+      _firmwareDownloadSummary = 'Starting firmware download...';
+      _firmwareDownloadLogBucket = null;
+    });
+    _log('Firmware download requested.');
+    try {
+      final result = await _firmware.downloadNetworkFirmware(
+        onProgress: (progress) {
+          if (!mounted) return;
+          setState(() {
+            _firmwareDownloadSummary = progress.message;
+            _firmwareDownloadProgress = progress.fraction;
+          });
+          if (_shouldLogFirmwareDownloadProgress(progress)) {
+            _log(progress.message);
+          }
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _firmwareController.text = result.path;
+        _firmwareDownloadSummary =
+            'Ready to flash: ${result.path} (${result.blockCount} UF2 blocks).';
+        _firmwareDownloadProgress = 1;
+      });
+      _log(
+        'Firmware download ready: ${result.path}; ${result.bytes} bytes verified.',
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _firmwareDownloadSummary = 'Firmware download failed: $error';
+        _firmwareDownloadProgress = null;
+      });
+      _log('Firmware download failed: $error');
+    } finally {
+      if (mounted) {
+        setState(() => _firmwareDownloading = false);
+      }
+    }
+  }
+
+  bool _shouldLogFirmwareDownloadProgress(FirmwareDownloadProgress progress) {
+    if (progress.done || progress.receivedBytes == 0) return true;
+    final fraction = progress.fraction;
+    if (fraction == null) return false;
+    final bucket = (fraction * 10).floor();
+    if (bucket == _firmwareDownloadLogBucket) return false;
+    _firmwareDownloadLogBucket = bucket;
+    return true;
+  }
+
   Future<void> _scanNow() async {
-    final volumes = await _watcher.scanNow();
+    _log('Manual scan requested.');
+    final volumes = await _watcher.scanNow(verbose: true);
     _handleVolumes(volumes);
     _log(
       'Manual scan found ${volumes.length} XRP ${_plural('volume', volumes.length)}.',
     );
+    for (final volume in volumes) {
+      _log('Manual scan result: ${_describeVolume(volume)}.');
+    }
   }
 
   Future<void> _flashAll() async {
@@ -590,6 +671,7 @@ class _DashboardPageState extends State<DashboardPage> {
       XrpConfigProgress.verifyingConfig => DeviceStage.verifyingConfig,
       XrpConfigProgress.configSaved => DeviceStage.configSaved,
     };
+    _log('Config progress for ${record.displayName}: ${stage.label}.');
     _setRecord(id, record.copyWith(stage: stage, clearError: true));
   }
 
@@ -682,6 +764,12 @@ class _DashboardPageState extends State<DashboardPage> {
 
   String _plural(String word, int count) => count == 1 ? word : '${word}s';
 
+  String _describeVolume(DetectedVolume volume) {
+    final method = volume.detectionMethod;
+    return '${volume.label} at ${volume.location}'
+        '${method == null ? '' : ' via $method'}';
+  }
+
   Future<void> _saveRecords() async {
     await _records.saveAll(_outputController.text.trim(), _robots.values);
   }
@@ -702,7 +790,7 @@ class _DashboardPageState extends State<DashboardPage> {
     if (!mounted) return;
     setState(() {
       _logs.insert(0, '${DateTime.now().toIso8601String()}  $message');
-      if (_logs.length > 200) _logs.removeLast();
+      if (_logs.length > 600) _logs.removeLast();
     });
   }
 
@@ -800,16 +888,19 @@ class _DashboardPageState extends State<DashboardPage> {
             autoFlash: _autoFlash,
             autoReadPicodisk: _autoReadPicodisk,
             autoSaveRecords: _autoSaveRecords,
-            connectWithNmcli: _connectWithNmcli,
+            connectWifiAutomatically: _connectWifiAutomatically,
             showLog: _showLog,
             latestReleaseSummary: _latestReleaseSummary,
+            firmwareDownloadSummary: _firmwareDownloadSummary,
+            firmwareDownloadProgress: _firmwareDownloadProgress,
+            firmwareDownloading: _firmwareDownloading,
             onAutoFlashChanged: (value) => setState(() => _autoFlash = value),
             onAutoReadChanged: (value) =>
                 setState(() => _autoReadPicodisk = value),
             onAutoSaveChanged: (value) =>
                 setState(() => _autoSaveRecords = value),
-            onNmcliChanged: (value) =>
-                setState(() => _connectWithNmcli = value),
+            onAutoWifiChanged: (value) =>
+                setState(() => _connectWifiAutomatically = value),
             onShowLogChanged: (value) => setState(() => _showLog = value),
             onScan: _scanNow,
             onFlashAll: _flashAll,
@@ -819,6 +910,7 @@ class _DashboardPageState extends State<DashboardPage> {
             onSaveRecords: _saveRecords,
             onClearLog: _clearLog,
             onCheckLatest: _checkLatestFirmware,
+            onDownloadFirmware: _downloadFirmwareFromNetwork,
           ),
           Expanded(
             child: LayoutBuilder(
@@ -908,13 +1000,16 @@ class _Toolbar extends StatelessWidget {
     required this.autoFlash,
     required this.autoReadPicodisk,
     required this.autoSaveRecords,
-    required this.connectWithNmcli,
+    required this.connectWifiAutomatically,
     required this.showLog,
     required this.latestReleaseSummary,
+    required this.firmwareDownloadSummary,
+    required this.firmwareDownloadProgress,
+    required this.firmwareDownloading,
     required this.onAutoFlashChanged,
     required this.onAutoReadChanged,
     required this.onAutoSaveChanged,
-    required this.onNmcliChanged,
+    required this.onAutoWifiChanged,
     required this.onShowLogChanged,
     required this.onScan,
     required this.onFlashAll,
@@ -924,6 +1019,7 @@ class _Toolbar extends StatelessWidget {
     required this.onSaveRecords,
     required this.onClearLog,
     required this.onCheckLatest,
+    required this.onDownloadFirmware,
   });
 
   final TextEditingController firmwareController;
@@ -936,13 +1032,16 @@ class _Toolbar extends StatelessWidget {
   final bool autoFlash;
   final bool autoReadPicodisk;
   final bool autoSaveRecords;
-  final bool connectWithNmcli;
+  final bool connectWifiAutomatically;
   final bool showLog;
   final String? latestReleaseSummary;
+  final String? firmwareDownloadSummary;
+  final double? firmwareDownloadProgress;
+  final bool firmwareDownloading;
   final ValueChanged<bool> onAutoFlashChanged;
   final ValueChanged<bool> onAutoReadChanged;
   final ValueChanged<bool> onAutoSaveChanged;
-  final ValueChanged<bool> onNmcliChanged;
+  final ValueChanged<bool> onAutoWifiChanged;
   final ValueChanged<bool> onShowLogChanged;
   final Future<void> Function() onScan;
   final Future<void> Function() onFlashAll;
@@ -952,6 +1051,7 @@ class _Toolbar extends StatelessWidget {
   final Future<void> Function() onSaveRecords;
   final VoidCallback onClearLog;
   final Future<void> Function() onCheckLatest;
+  final Future<void> Function() onDownloadFirmware;
 
   @override
   Widget build(BuildContext context) {
@@ -1081,6 +1181,15 @@ class _Toolbar extends StatelessWidget {
                   icon: const Icon(Icons.cloud_download),
                   label: const Text('Latest'),
                 ),
+                TextButton.icon(
+                  onPressed: firmwareDownloading
+                      ? null
+                      : () => unawaited(onDownloadFirmware()),
+                  icon: const Icon(Icons.download),
+                  label: Text(
+                    firmwareDownloading ? 'Downloading' : 'Download UF2',
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 10),
@@ -1109,9 +1218,9 @@ class _Toolbar extends StatelessWidget {
                 ),
                 _OptionSwitch(
                   icon: Icons.wifi,
-                  label: 'nmcli',
-                  value: connectWithNmcli,
-                  onChanged: onNmcliChanged,
+                  label: 'Auto Wi-Fi',
+                  value: connectWifiAutomatically,
+                  onChanged: onAutoWifiChanged,
                 ),
                 _OptionSwitch(
                   icon: Icons.subject,
@@ -1131,6 +1240,22 @@ class _Toolbar extends StatelessWidget {
               Text(
                 latestReleaseSummary!,
                 maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            if (firmwareDownloadSummary != null) ...[
+              const SizedBox(height: 8),
+              if (firmwareDownloading || firmwareDownloadProgress != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: LinearProgressIndicator(
+                    value: firmwareDownloadProgress,
+                  ),
+                ),
+              Text(
+                firmwareDownloadSummary!,
+                maxLines: 3,
                 overflow: TextOverflow.ellipsis,
                 style: Theme.of(context).textTheme.bodySmall,
               ),

@@ -64,12 +64,14 @@ class DetectedVolume {
     required this.mountPath,
     required this.label,
     this.devicePath,
+    this.detectionMethod,
   });
 
   final String source;
   final String mountPath;
   final String label;
   final String? devicePath;
+  final String? detectionMethod;
 
   bool get isBootloader {
     final normalized = label.toUpperCase();
@@ -88,12 +90,14 @@ class DetectedVolume {
     String? mountPath,
     String? label,
     String? devicePath,
+    String? detectionMethod,
   }) {
     return DetectedVolume(
       source: source ?? this.source,
       mountPath: mountPath ?? this.mountPath,
       label: label ?? this.label,
       devicePath: devicePath ?? this.devicePath,
+      detectionMethod: detectionMethod ?? this.detectionMethod,
     );
   }
 
@@ -290,6 +294,7 @@ class RobotRecord {
       'mountPath': volume.mountPath,
       'label': volume.label,
       'devicePath': volume.devicePath,
+      'detectionMethod': volume.detectionMethod,
     };
   }
 
