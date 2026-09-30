@@ -1,0 +1,57 @@
+name: Publish verified MECCA website
+on:
+  push:
+    branches: [mecca-render-temp]
+    paths: [.github/workflows/mecca-publish.yml]
+permissions:
+  contents: write
+concurrency:
+  group: mecca-site-publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify and publish the static bundle to its deployment branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_BRANCH: mecca-render-temp
+          BUNDLE_SHA256: 16dd8966f43e7a5283826acc65f801a28c1c16392e28820b5b56adb933c7d977
+          BUNDLE_URL: 'https://sdmntprseasia.oaiusercontent.com/files/00000000-4d58-8207-b7c0-fa4cffcedf75/raw?se=2026-09-30T21%3A38%3A23Z&sp=r&sv=2026-02-06&sr=b&scid=38ce54cc-5196-53e5-b014-c251d6ec7653&skoid=5e5afa93-cb2e-42ad-a58a-830b5b446f03&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-09-30T18%3A35%3A39Z&ske=2026-10-01T18%3A35%3A39Z&sks=b&skv=2026-02-06&sig=bMypc9YyzbXVByShMR0qorqsE9KOWmBA5F8wc34do%2BY%3D'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '::add-mask::%s\n' "$BUNDLE_URL"
+          curl --fail --silent --show-error --location --retry 2 "$BUNDLE_URL" --output /tmp/mecca-site.zip
+          printf '%s  /tmp/mecca-site.zip\n' "$BUNDLE_SHA256" | sha256sum --check --strict
+          git clone --quiet --depth 1 --single-branch --branch "$DEPLOY_BRANCH" "https://github.com/$GITHUB_REPOSITORY.git" site
+          cd site
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git rm -r --quiet --ignore-unmatch .
+          python3 - <<'PY'
+          import hashlib, json, pathlib, zipfile
+          root = pathlib.Path.cwd()
+          with zipfile.ZipFile('/tmp/mecca-site.zip') as archive:
+              for item in archive.infolist():
+                  p = pathlib.PurePosixPath(item.filename)
+                  if p.is_absolute() or '..' in p.parts or '.git' in p.parts:
+                      raise RuntimeError('Invalid bundle path')
+              archive.extractall(root)
+          manifest = json.loads((root / 'build-info.json').read_text())
+          assert manifest['version'] == 'mecca-refined-20260930'
+          assert manifest['qa_checks_passed'] == 600
+          for name, expected in manifest['files'].items():
+              assert hashlib.sha256((root / name).read_bytes()).hexdigest() == expected, name
+          for name in ['index.html','services/index.html','parts/index.html','about/index.html','contact/index.html']:
+              assert (root / name).is_file(), name
+          print('Verified', len(manifest['files']), 'static files and five pages.')
+          PY
+          git config user.name 'MECCA Site Deploy'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git commit --quiet -m 'Publish verified MECCA refinement: 600 checks passed [skip ci]'
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          printf '::add-mask::%s\n' "$AUTH"
+          git -c "http.extraheader=AUTHORIZATION: basic $AUTH" push --quiet origin "HEAD:refs/heads/$DEPLOY_BRANCH"
+          git rev-parse HEAD
